@@ -1,146 +1,157 @@
 import os
-from moviepy.editor import *
-from syncstart import file_offset
+import subprocess
+from pathlib import Path
+from typing import List, Tuple, Dict
 import pandas as pd
 from moviepy.editor import VideoFileClip
-import subprocess
 
-# 定义时间转换函数
-def str2sec(x):
-    hours, minutes, seconds = map(int, x.split(":"))
-    return hours * 3600 + minutes * 60 + seconds
+# ----------------- 用户配置 -----------------
+SOURCE_DIR = "gopro/"                    # 源视频目录
+CSV_PATH = "syncstart_result/sync_results.csv"  # 输出CSV路径
+EDIT_VIDEOS = False                      # 是否修剪并导出同步后的视频
+OUTPUT_DIR = "synced_videos"             # 修剪后视频输出目录
+TAKE = 20                                # 传给 file_offset 的 take 参数
+SHOW = False                             # 是否显示 file_offset 的中间结果
+# --------------------------------------------
 
-def str2sec_(x):
-    hours, minutes, seconds = map(int, x.split(":"))
-    return hours * 3600 + minutes * 60 + seconds
+def get_file_offset(in1: str, in2: str, take: int = 500, show: bool = False) -> Tuple[str, float]:
+    try:
+        from syncstart import file_offset as _file_offset
+    except Exception as e:
+        raise RuntimeError(f"无法导入 syncstart 模块：{e}")
+    return _file_offset(in1=in1, in2=in2, take=take, show=show)
 
-# 定义源文件路径
-# source_video_dir = "source_video/"
-source_video_dir = "gopro/"
-video_list = os.listdir(source_video_dir)
-video_list.sort()  # 保证顺序一致，选第一个为基准
-data_list = []
 
-def new_func(offset):
-    signed_offset = offset
-    return signed_offset
+def get_video_list(source_dir: str) -> List[str]:
+    """返回目录下的文件名列表（按字母排序）。"""
+    p = Path(source_dir)
+    if not p.exists() or not p.is_dir():
+        return []
+    return sorted([f.name for f in p.iterdir() if f.is_file()])
 
-if len(video_list) < 2:
-    print("视频文件不足2个，无法比较。")
-else:
-    base = video_list[0]
-    base_video_dir = os.path.join(source_video_dir, base)
 
-    for target in video_list[1:]:
-        target_video_dir = os.path.join(source_video_dir, target)
-        data_dict = {
-            'in1': base_video_dir,
-            'in2': target_video_dir,
-            'take': 500,
-            'show': False
-        }
-        file, offset = file_offset(**data_dict)
-        # file 是开始较早的，需要被裁减的视频
-        # 判断 file 是否为 base，如果是，则 signed_offset 取负值，否则取正值
-        if os.path.abspath(file) == os.path.abspath(base_video_dir):
-            signed_offset = -offset
-        else:
-            signed_offset = offset
-        data_list.append((base, target, signed_offset))
+def compute_pair_offsets(base: str, targets: List[str], source_dir: str, take: int = 500, show: bool = False) -> List[Tuple[str, str, float]]:
+    """计算 base 与每个 target 之间的 signed offset。"""
+    base_path = os.path.join(source_dir, base)
+    data = []
+    for target in targets:
+        target_path = os.path.join(source_dir, target)
+        file, offset = get_file_offset(in1=base_path, in2=target_path, take=take, show=show)
+        # 如果返回的 file 是 base（更早的需要被裁剪），则取负值
+        signed_offset = -offset if os.path.abspath(file) == os.path.abspath(base_path) else offset
+        data.append((base, target, signed_offset))
+    return data
 
-    # 新增逻辑：判断signed_offset全为正还是有负数
+
+def choose_base_and_compute_all(video_list: List[str], source_dir: str, take: int = 500, show: bool = False) -> Tuple[str, List[Tuple[str, str, float]]]:
+    """选择基准视频并计算相对于基准的视频偏移列表（包含基准自身）。"""
+    if not video_list:
+        raise ValueError("视频列表为空")
+
+    initial_base = video_list[0]
+    data_list = compute_pair_offsets(initial_base, video_list[1:], source_dir, take=take, show=show)
+
     signed_offsets = [item[2] for item in data_list]
     if all(so >= 0 for so in signed_offsets):
-        # 当前base就是最晚的，直接用data_list生成final_data_list
-        new_base = base
-        new_base_video_dir = base_video_dir
-        final_data_list = [(new_base, base, 0)]
-        for entry in data_list:
-            _, target, signed_offset = entry
-            final_data_list.append((new_base, target, signed_offset))
-    else:
-        # 存在负数，最小负数对应的target为新base
-        min_offset = min(signed_offsets)
-        min_index = signed_offsets.index(min_offset)
-        new_base = data_list[min_index][1]
-        new_base_video_dir = os.path.join(source_video_dir, new_base)
-        # 以新base重新计算所有视频与新base的offset
-        final_data_list = [(new_base, new_base, 0)]
-        for video in video_list:
-            if video == new_base:
-                continue
-            video_dir = os.path.join(source_video_dir, video)
-            data_dict = {
-                'in1': new_base_video_dir,
-                'in2': video_dir,
-                'take': 500,
-                'show': False
-            }
-            file, offset = file_offset(**data_dict)
-            if os.path.abspath(file) == os.path.abspath(new_base_video_dir):
-                signed_offset = -offset
-            else:
-                signed_offset = offset
-            final_data_list.append((new_base, video, signed_offset))
+        final = [(initial_base, initial_base, 0.0)] + data_list
+        return initial_base, final
+
+    # 否则找到最小的负值对应的 video 作为新的 base，重新计算
+    min_offset = min(signed_offsets)
+    min_index = signed_offsets.index(min_offset)
+    new_base = data_list[min_index][1]
+    new_base_path = os.path.join(source_dir, new_base)
+
+    final = [(new_base, new_base, 0.0)]
+    for video in video_list:
+        if video == new_base:
+            continue
+        file, offset = get_file_offset(in1=new_base_path, in2=os.path.join(source_dir, video), take=take, show=show)
+        signed_offset = -offset if os.path.abspath(file) == os.path.abspath(new_base_path) else offset
+        final.append((new_base, video, signed_offset))
+
+    return new_base, final
 
 
-    # 保存最终结果
-    df = pd.DataFrame(final_data_list, columns=["base_file", "target_file", "offset_seconds"])
-    df.to_csv("syncstart_result/sync_results.csv", index=False)
-    
-    print("同步分析完成！")
-    print(f"基准文件为：{new_base}")
-    print(f"结果已保存至 syncstart_result/sync_results.csv")
+def save_results(final_list: List[Tuple[str, str, float]], out_csv: str) -> pd.DataFrame:
+    """保存结果为 CSV 并返回 DataFrame。"""
+    out_path = Path(out_csv)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(final_list, columns=["base_file", "target_file", "offset_seconds"])
+    df.to_csv(out_path, index=False)
+    return df
 
-    # === 修剪视频并保存到新文件夹 ===
-    output_dir = "synced_videos"
-    os.makedirs(output_dir, exist_ok=True)
 
-    # 统计所有视频修剪后应有的最短时长（以帧数为准）
-    video_paths = [os.path.join(source_video_dir, v) for v in video_list]
-    # offsets字典应包含所有视频，基准视频offset为0
-    offsets = {row['target_file']: row['offset_seconds'] for _, row in df.iterrows()}
-    offsets[new_base] = 0
+def trim_videos(video_list: List[str], source_dir: str, offsets: Dict[str, float], output_dir: str = "synced_videos", codec: str = "hevc_nvenc", crf: int = 18) -> int:
+    """修剪并导出同步后的视频，返回统一的帧数（min_frames）。"""
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 获取所有视频修剪后剩余帧数
     frame_counts = []
-    durations = []
     for v in video_list:
-        path = os.path.join(source_video_dir, v)
-        offset = offsets.get(v, 0)
-        clip = VideoFileClip(path)
-        duration = clip.duration - max(0, offset)
-        durations.append(duration)
-        fps = clip.fps
-        frames = int(duration * fps)
-        frame_counts.append(frames)
-        clip.close()
+        path = os.path.join(source_dir, v)
+        offset = offsets.get(v, 0.0)
+        with VideoFileClip(path) as clip:
+            duration = clip.duration - max(0, offset)
+            fps = clip.fps or 30
+            frames = int(duration * fps)
+            frame_counts.append(frames)
+
     min_frames = min(frame_counts)
 
-    # 修剪并导出所有视频
     for v in video_list:
-        src_path = os.path.join(source_video_dir, v)
-        offset = offsets.get(v, 0)
-        out_path = os.path.join(output_dir, v)
-        clip = VideoFileClip(src_path)
-        fps = clip.fps
-        # 计算修剪后的视频长度（以帧为准，保证所有视频帧数一致）
-        trim_duration = min_frames / fps
-        start = max(0, offset)
-        end = start + trim_duration
-        # 防止end超过原视频长度
-        end = min(end, clip.duration)
-        # 使用ffmpeg命令修剪，使用hevc_nvenc编码
+        src_path = os.path.join(source_dir, v)
+        offset = offsets.get(v, 0.0)
+        out_path = str(out_dir / v)
+        with VideoFileClip(src_path) as clip:
+            fps = clip.fps or 30
+            trim_duration = min_frames / fps
+            start = max(0, offset)
+            end = start + trim_duration
+            end = min(end, clip.duration)
+
         cmd = [
             "ffmpeg", "-y",
             "-ss", str(start),
             "-i", src_path,
             "-t", str(end - start),
-            "-c:v", "hevc_nvenc",
-            "-crf", "18",
-            out_path
+            "-c:v", codec,
+            "-crf", str(crf),
+            out_path,
         ]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        clip.close()
 
-    print(f"所有同步后的视频已保存至 {output_dir}，帧数统一为 {min_frames} 帧。")
+    return min_frames
+
+
+def main():
+    source = SOURCE_DIR
+    csv_path = CSV_PATH
+    edit = EDIT_VIDEOS
+    output = OUTPUT_DIR
+    take = TAKE
+    show = SHOW
+
+    print(f"运行配置: source={source}, csv={csv_path}, edit={edit}, output={output}, take={take}, show={show}")
+
+    video_list = get_video_list(source)
+    if len(video_list) < 2:
+        print("视频文件不足2个，无法比较。")
+        return
+
+    new_base, final_data_list = choose_base_and_compute_all(video_list, source, take=take, show=show)
+    df = save_results(final_data_list, csv_path)
+
+    print("同步分析完成！ ✅")
+    print(f"基准文件为：{new_base}")
+    print(f"结果已保存至 {csv_path}")
+
+    if edit:
+        offsets = {row['target_file']: row['offset_seconds'] for _, row in df.iterrows()}
+        offsets[new_base] = 0.0
+        min_frames = trim_videos(video_list, source, offsets, output_dir=output)
+        print(f"所有同步后的视频已保存至 {output}，帧数统一为 {min_frames} 帧。 ✅")
+
+
+if __name__ == "__main__":
+    main()

@@ -37,9 +37,7 @@ python audio_video_align.py
 
 ## 输出说明 📦
 - CSV 文件（由 `CSV_PATH` 指定）包含列：`base_file, target_file, offset_seconds`。
-- 偏移含义：
-  - 正值：目标比基准晚开始（需要从头跳过 offset 秒）。
-  - 负值：目标比基准早开始（需要裁掉目标前部以与基准对齐）。
+- target 比 base 晚开始,需要裁掉target 前 offset 秒以与 base 对齐。
 
 ---
 
@@ -94,5 +92,3 @@ python audio_video_align.py
 ---
 
 ---
-
-需要我把此 README 自动提交（git commit）并推送到远程仓库，或为 README 写英文版吗？
